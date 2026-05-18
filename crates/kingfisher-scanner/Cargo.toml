@@ -24,6 +24,7 @@ validation-http = [
     "dep:liquid-core",
     "dep:quick-xml",
     "dep:sha1",
+    "dep:hex",
     "dep:time",
 ]
 

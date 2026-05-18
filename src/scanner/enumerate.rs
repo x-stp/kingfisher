@@ -841,9 +841,9 @@ impl<'a> rayon::iter::ParallelIterator for GitRepoResultIter<'a> {
         };
 
         // After flat-mapping, errors and successes both flow as
-        // `Result<(OriginSet, Blob)>`. Filter out the silenced timeout
+        // `Result<(OriginSet, Blob<'a>)>`. Filter out the silenced timeout
         // marker before handing items to the scan consumer.
-        let timeout_filter = |res: &Result<(OriginSet, Blob)>| -> bool {
+        let timeout_filter = |res: &Result<(OriginSet, Blob<'a>)>| -> bool {
             !matches!(res, Err(e) if e.to_string() == "__timeout_silenced__")
         };
 

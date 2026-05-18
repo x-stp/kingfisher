@@ -229,7 +229,9 @@ pub fn extract_zip_archive_in_memory(
 /// short-circuit extraction attempts on blobs whose extension matches a
 /// ZIP-based format but whose contents are not actually a real ZIP.
 pub fn looks_like_zip(data: &[u8]) -> bool {
-    matches!(data.get(..4), Some(b"PK\x03\x04" | b"PK\x05\x06" | b"PK\x07\x08"))
+    data.starts_with(b"PK\x03\x04")
+        || data.starts_with(b"PK\x05\x06")
+        || data.starts_with(b"PK\x07\x08")
 }
 
 fn handle_zip_archive_streaming(
