@@ -50,22 +50,33 @@ pub enum CompressedContent {
 }
 
 pub fn is_safe_extract_path(path: &Path) -> bool {
-    for (idx, comp) in path.components().enumerate() {
+    if path.is_absolute() {
+        return false;
+    }
+
+    for comp in path.components() {
         match comp {
             // Never allow parent-directory escapes
             Component::ParentDir => return false,
 
-            // Leading "C:\" (Windows) or "/" (Unix) is fine;
-            // a prefix later in the path would be suspicious.
-            Component::Prefix(_) | Component::RootDir if idx == 0 => continue,
-
-            // A prefix *inside* the path (e.g. "foo/C:\evil") is unsafe
-            Component::Prefix(_) => return false,
+            // Archive entry names must always be relative to the extraction root.
+            Component::Prefix(_) | Component::RootDir => return false,
 
             _ => {}
         }
     }
     true
+}
+
+fn has_parent_or_embedded_prefix(path: &Path) -> bool {
+    for (idx, comp) in path.components().enumerate() {
+        match comp {
+            Component::ParentDir => return true,
+            Component::Prefix(_) if idx > 0 => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn is_zip_format(ext: &str) -> bool {
@@ -87,6 +98,10 @@ fn handle_tar_archive_streaming(
         let mut entry = entry?;
         if entry.header().entry_type().is_file() {
             let path_in_tar = entry.path()?.to_string_lossy().to_string();
+            if !is_safe_extract_path(Path::new(&path_in_tar)) {
+                tracing::warn!("unsafe tar path: {path_in_tar}");
+                continue;
+            }
             let logical_path = format!("{}!{}", archive_path.display(), path_in_tar);
 
             let out_path = base_dir.join(&path_in_tar);
@@ -95,10 +110,6 @@ fn handle_tar_archive_streaming(
                     tracing::debug!("failed to create directory {}: {}", parent.display(), e);
                     continue;
                 }
-            }
-            if !is_safe_extract_path(&out_path) {
-                tracing::warn!("unsafe tar path: {}", out_path.display());
-                continue;
             }
             match fs::File::create(&out_path) {
                 Ok(mut out_file) => {
@@ -239,6 +250,10 @@ fn handle_zip_archive_streaming(
         let mut zipped_file = zip.by_index(i)?;
         if zipped_file.is_file() {
             let name_in_zip = zipped_file.name().to_string();
+            if !is_safe_extract_path(Path::new(&name_in_zip)) {
+                tracing::warn!("unsafe zip path: {name_in_zip}");
+                continue;
+            }
             let logical_path = format!("{}!{}", archive_path.display(), name_in_zip);
 
             let out_path = base_dir.join(&name_in_zip);
@@ -247,10 +262,6 @@ fn handle_zip_archive_streaming(
                     tracing::debug!("failed to create directory {}: {}", parent.display(), e);
                     continue;
                 }
-            }
-            if !is_safe_extract_path(&out_path) {
-                tracing::warn!("unsafe zip path: {}", out_path.display());
-                continue;
             }
             match fs::File::create(&out_path) {
                 Ok(mut out_file) => {
@@ -381,7 +392,7 @@ fn handle_asar_archive_in_memory(buffer: &[u8], archive_path: &Path) -> Result<C
 
 /// Validate and open a file for reading, checking for path traversal attacks.
 fn safe_open_for_read(path: &Path) -> Result<fs::File> {
-    if !is_safe_extract_path(path) {
+    if has_parent_or_embedded_prefix(path) {
         anyhow::bail!("unsafe input path during decompression: {}", path.display());
     }
     Ok(fs::File::open(path)?)
@@ -389,7 +400,7 @@ fn safe_open_for_read(path: &Path) -> Result<fs::File> {
 
 /// Validate and create a file for writing, checking for path traversal attacks.
 fn safe_create_for_write(path: &Path) -> Result<fs::File> {
-    if !is_safe_extract_path(path) {
+    if has_parent_or_embedded_prefix(path) {
         anyhow::bail!("unsafe output path during decompression: {}", path.display());
     }
     Ok(fs::File::create(path)?)

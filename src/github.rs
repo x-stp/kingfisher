@@ -8,11 +8,6 @@ use std::{
 
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use octorust::{
-    Client,
-    auth::Credentials,
-    types::{Order, ReposListOrgSort, ReposListOrgType, ReposListUserType},
-};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
@@ -31,6 +26,11 @@ struct GitHubContributor {
 struct GitHubRepo {
     clone_url: String,
     fork: bool,
+}
+
+#[derive(Deserialize)]
+struct GitHubOrg {
+    login: String,
 }
 
 #[derive(Debug)]
@@ -52,21 +52,20 @@ pub enum RepoType {
     Source,
     Fork,
 }
-impl From<RepoType> for ReposListUserType {
-    fn from(repo_type: RepoType) -> Self {
-        match repo_type {
-            RepoType::All => ReposListUserType::All,
-            RepoType::Source => ReposListUserType::Owner,
-            RepoType::Fork => ReposListUserType::Member,
+impl RepoType {
+    fn user_query_value(&self) -> &'static str {
+        match self {
+            RepoType::All => "all",
+            RepoType::Source => "owner",
+            RepoType::Fork => "member",
         }
     }
-}
-impl From<RepoType> for ReposListOrgType {
-    fn from(repo_type: RepoType) -> Self {
-        match repo_type {
-            RepoType::All => ReposListOrgType::All,
-            RepoType::Source => ReposListOrgType::Sources,
-            RepoType::Fork => ReposListOrgType::Forks,
+
+    fn org_query_value(&self) -> &'static str {
+        match self {
+            RepoType::All => "all",
+            RepoType::Source => "sources",
+            RepoType::Fork => "forks",
         }
     }
 }
@@ -128,34 +127,13 @@ fn build_exclude_matcher(exclude_repos: &[String]) -> git_host::ExcludeMatcher {
 fn should_exclude_repo(clone_url: &str, excludes: &git_host::ExcludeMatcher) -> bool {
     git_host::should_exclude_repo(clone_url, excludes, parse_repo_name_from_url)
 }
-fn create_github_client(github_url: &url::Url, ignore_certs: bool) -> Result<Arc<Client>> {
-    // Try personal access token
-    let credentials = if let Ok(token) = env::var("KF_GITHUB_TOKEN") {
-        Credentials::Token(token)
-    } else {
-        Credentials::Token("".to_string()) // Anonymous access
-    };
-
+fn create_github_client(ignore_certs: bool) -> Result<Arc<reqwest::Client>> {
     let mut client_builder = reqwest::Client::builder();
     if ignore_certs {
         client_builder = client_builder.danger_accept_invalid_certs(ignore_certs);
     }
 
-    let reqwest_client = client_builder.build().context("Failed to build HTTP client")?;
-
-    let http_client = reqwest_middleware_octorust::ClientBuilder::new(reqwest_client).build();
-
-    let mut client = Client::custom(
-        concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")),
-        credentials,
-        http_client,
-    );
-
-    // Override host if not using api.github.com
-    if github_url.host_str() != Some("api.github.com") {
-        client.with_host_override(github_url.as_str());
-    }
-    Ok(Arc::new(client))
+    Ok(Arc::new(client_builder.build().context("Failed to build HTTP client")?))
 }
 
 fn normalize_api_base(api_url: &Url) -> Url {
@@ -165,6 +143,77 @@ fn normalize_api_base(api_url: &Url) -> Url {
         base.set_path(&path);
     }
     base
+}
+
+fn github_token() -> Option<String> {
+    env::var("KF_GITHUB_TOKEN").ok().filter(|t| !t.is_empty())
+}
+
+fn github_get(client: &reqwest::Client, url: Url, token: Option<&str>) -> reqwest::RequestBuilder {
+    let req = client.get(url).header("User-Agent", GLOBAL_USER_AGENT.as_str());
+    if let Some(token) = token { req.bearer_auth(token) } else { req }
+}
+
+async fn fetch_github_orgs(
+    client: &reqwest::Client,
+    api_base: &Url,
+    token: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut orgs = Vec::new();
+    let mut page = 1;
+
+    loop {
+        let mut url = api_base.join("organizations").context("Failed to build GitHub orgs URL")?;
+        url.query_pairs_mut().append_pair("per_page", "100").append_pair("page", &page.to_string());
+        let resp = github_get(client, url, token).send().await?;
+        if !resp.status().is_success() {
+            warn_on_rate_limit("GitHub", resp.status(), "listing organizations");
+            break;
+        }
+        let page_orgs: Vec<GitHubOrg> = resp.json().await?;
+        if page_orgs.is_empty() {
+            break;
+        }
+        orgs.extend(page_orgs.into_iter().map(|org| org.login));
+        page += 1;
+    }
+
+    Ok(orgs)
+}
+
+async fn fetch_github_repos(
+    client: &reqwest::Client,
+    api_base: &Url,
+    path: &str,
+    repo_type: &str,
+    token: Option<&str>,
+    action: &str,
+) -> Result<Vec<GitHubRepo>> {
+    let mut repos = Vec::new();
+    let mut page = 1;
+
+    loop {
+        let mut url = api_base.join(path).context("Failed to build GitHub repositories URL")?;
+        url.query_pairs_mut()
+            .append_pair("per_page", "100")
+            .append_pair("page", &page.to_string())
+            .append_pair("type", repo_type)
+            .append_pair("sort", "created")
+            .append_pair("direction", "desc");
+        let resp = github_get(client, url, token).send().await?;
+        if !resp.status().is_success() {
+            warn_on_rate_limit("GitHub", resp.status(), action);
+            break;
+        }
+        let page_repos: Vec<GitHubRepo> = resp.json().await?;
+        if page_repos.is_empty() {
+            break;
+        }
+        repos.extend(page_repos);
+        page += 1;
+    }
+
+    Ok(repos)
 }
 
 pub async fn enumerate_contributor_repo_urls(
@@ -179,7 +228,7 @@ pub async fn enumerate_contributor_repo_urls(
     let (_, owner, repo) = parse_repo(repo_url).context("invalid GitHub repo URL")?;
     let exclude_set = build_exclude_matcher(exclude_repos);
     let client = reqwest::Client::builder().danger_accept_invalid_certs(ignore_certs).build()?;
-    let token = env::var("KF_GITHUB_TOKEN").ok().filter(|t| !t.is_empty());
+    let token = github_token();
     let api_base = normalize_api_base(github_api_url);
 
     let mut contributor_logins = Vec::new();
@@ -190,11 +239,7 @@ pub async fn enumerate_contributor_repo_urls(
             .join(&format!("repos/{owner}/{repo}/contributors"))
             .context("Failed to build GitHub contributors URL")?;
         url.query_pairs_mut().append_pair("per_page", "100").append_pair("page", &page.to_string());
-        let mut req = client.get(url).header("User-Agent", GLOBAL_USER_AGENT.as_str());
-        if let Some(token) = token.as_ref() {
-            req = req.bearer_auth(token);
-        }
-        let resp = req.send().await?;
+        let resp = github_get(&client, url, token.as_deref()).send().await?;
         if !resp.status().is_success() {
             warn_on_rate_limit("GitHub", resp.status(), "listing contributors");
             break;
@@ -251,11 +296,7 @@ pub async fn enumerate_contributor_repo_urls(
                 .append_pair("type", "all")
                 .append_pair("sort", "updated")
                 .append_pair("direction", "desc");
-            let mut req = client.get(url).header("User-Agent", GLOBAL_USER_AGENT.as_str());
-            if let Some(token) = token.as_ref() {
-                req = req.bearer_auth(token);
-            }
-            let resp = req.send().await?;
+            let resp = github_get(&client, url, token.as_deref()).send().await?;
             if !resp.status().is_success() {
                 warn_on_rate_limit("GitHub", resp.status(), "listing user repositories");
                 break;
@@ -351,22 +392,22 @@ pub async fn enumerate_repo_urls(
     ignore_certs: bool,
     mut progress: Option<&mut ProgressBar>,
 ) -> Result<Vec<String>> {
-    let client = create_github_client(&github_url, ignore_certs)?;
+    let client = create_github_client(ignore_certs)?;
     let mut repo_urls = Vec::new();
     let exclude_set = build_exclude_matcher(&repo_specifiers.exclude_repos);
-    let user_repo_type: ReposListUserType = repo_specifiers.repo_filter.clone().into();
-    let org_repo_type: ReposListOrgType = repo_specifiers.repo_filter.clone().into();
+    let api_base = normalize_api_base(&github_url);
+    let token = github_token();
     for username in &repo_specifiers.user {
-        let repos = client
-            .repos()
-            .list_all_for_user(
-                username,
-                user_repo_type.clone(),
-                ReposListOrgSort::Created,
-                Order::Desc,
-            )
-            .await?;
-        repo_urls.extend(repos.body.into_iter().filter_map(|repo| {
+        let repos = fetch_github_repos(
+            &client,
+            &api_base,
+            &format!("users/{username}/repos"),
+            repo_specifiers.repo_filter.user_query_value(),
+            token.as_deref(),
+            "listing user repositories",
+        )
+        .await?;
+        repo_urls.extend(repos.into_iter().filter_map(|repo| {
             let clone_url = repo.clone_url;
             if should_exclude_repo(&clone_url, &exclude_set) { None } else { Some(clone_url) }
         }));
@@ -375,24 +416,21 @@ pub async fn enumerate_repo_urls(
         }
     }
     let orgs = if repo_specifiers.all_organizations {
-        let mut all_orgs = Vec::new();
-        let org_list = client.orgs().list_all(100).await?;
-        all_orgs.extend(org_list.body.into_iter().map(|org| org.login));
-        all_orgs
+        fetch_github_orgs(&client, &api_base, token.as_deref()).await?
     } else {
         repo_specifiers.organization.clone()
     };
     for org_name in orgs {
-        let repos = client
-            .repos()
-            .list_all_for_org(
-                &org_name,
-                org_repo_type.clone(),
-                ReposListOrgSort::Created,
-                Order::Desc,
-            )
-            .await?;
-        repo_urls.extend(repos.body.into_iter().filter_map(|repo| {
+        let repos = fetch_github_repos(
+            &client,
+            &api_base,
+            &format!("orgs/{org_name}/repos"),
+            repo_specifiers.repo_filter.org_query_value(),
+            token.as_deref(),
+            "listing organization repositories",
+        )
+        .await?;
+        repo_urls.extend(repos.into_iter().filter_map(|repo| {
             let clone_url = repo.clone_url;
             if should_exclude_repo(&clone_url, &exclude_set) { None } else { Some(clone_url) }
         }));

@@ -235,7 +235,7 @@ impl BlobId {
     pub fn new(input: &[u8]) -> Self {
         const CHUNK: usize = 64 * 1024; // 64KB from start and end
         let mut hasher = Sha1::new();
-        hasher.update(format!("blob {}\0", input.len()).as_bytes());
+        update_git_blob_header(&mut hasher, input.len());
         if input.len() <= CHUNK * 2 {
             hasher.update(input);
         } else {
@@ -249,7 +249,7 @@ impl BlobId {
     /// Computes a `BlobId` from the complete bytes (no truncation).
     pub fn compute_from_bytes(bytes: &[u8]) -> Self {
         let mut hasher = Sha1::new();
-        hasher.update(format!("blob {}\0", bytes.len()).as_bytes());
+        update_git_blob_header(&mut hasher, bytes.len());
         hasher.update(bytes);
         let digest: [u8; 20] = hasher.finalize().into();
         BlobId(digest)
@@ -275,6 +275,27 @@ impl BlobId {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+}
+
+fn update_git_blob_header(hasher: &mut Sha1, len: usize) {
+    let mut digits = [0u8; 20];
+    let mut n = len;
+    let mut i = digits.len();
+
+    if n == 0 {
+        i -= 1;
+        digits[i] = b'0';
+    } else {
+        while n > 0 {
+            i -= 1;
+            digits[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+    }
+
+    hasher.update(b"blob ");
+    hasher.update(&digits[i..]);
+    hasher.update(b"\0");
 }
 
 impl<'de> Deserialize<'de> for BlobId {

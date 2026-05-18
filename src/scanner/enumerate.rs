@@ -1,4 +1,5 @@
 use std::{
+    io::Read,
     marker::PhantomData,
     path::Path,
     process::Command,
@@ -212,12 +213,10 @@ pub fn enumerate_filesystem_inputs(
                     }
                     Ok(entry) => entry,
                 };
-                // Check if this is an archive file
-                let is_archive = if let Origin::File(file_origin) = &origin.first() {
-                    is_compressed_file(&file_origin.path)
-                } else {
-                    false
-                };
+                // Check if this is an archive file. `blob_path()` covers both filesystem and git
+                // origins, so archive/binary filtering stays consistent across input modes.
+                let is_archive =
+                    origin.first().blob_path().map(is_compressed_file).unwrap_or(false);
                 let is_binary = is_binary(&blob.bytes());
                 let should_skip = if is_archive {
                     // For archives: skip only if --no_extract_archives is true
@@ -542,11 +541,10 @@ fn try_extract_git_blob_archive(
         return Ok(None);
     }
 
-    // Carry the original filename through so the decompressor picks the
-    // correct format (zip-based, gz, tar, ...). decompress_file_to_temp
-    // dispatches on extension, so the extension MUST match the actual
-    // bytes — using the in-tree filename is the right move.
-    let basename = pb.file_name().and_then(|s| s.to_str()).unwrap_or("blob").to_string();
+    // Use the repo-relative path in reports while staging the blob under its basename so the
+    // decompressor still dispatches on the original extension.
+    let archive_label = blob_path.to_string();
+    let staged_name = pb.file_name().and_then(|s| s.to_str()).unwrap_or("blob").to_string();
 
     // ── fast path: ZIP-based archives extract entirely in memory ──
     //
@@ -577,18 +575,18 @@ fn try_extract_git_blob_archive(
             return Ok(None);
         }
         if data.len() <= MAX_INMEM_ZIP_ARCHIVE_BYTES {
-            return match extract_zip_archive_in_memory(data, &basename) {
+            return match extract_zip_archive_in_memory(data, &archive_label) {
                 Ok(entries) => Ok(Some(entries)),
                 Err(e) => {
                     debug!(
-                        "in-memory zip extract failed for {basename}: {e:#}; falling back to raw scan"
+                        "in-memory zip extract failed for {archive_label}: {e:#}; falling back to raw scan"
                     );
                     Ok(None)
                 }
             };
         }
         debug!(
-            "{basename} is {} bytes (> {} MB cap); falling back to disk streaming extractor",
+            "{archive_label} is {} bytes (> {} MB cap); falling back to disk streaming extractor",
             data.len(),
             MAX_INMEM_ZIP_ARCHIVE_BYTES / (1024 * 1024)
         );
@@ -599,7 +597,7 @@ fn try_extract_git_blob_archive(
     //               and large ZIP-based archives that exceeded the
     //               in-memory cap above. ──
     let staging = tempfile::tempdir().context("Failed to create staging tempdir for git blob")?;
-    let staged_path = staging.path().join(&basename);
+    let staged_path = staging.path().join(&staged_name);
     std::fs::write(&staged_path, data)
         .with_context(|| format!("Failed to stage blob to {}", staged_path.display()))?;
 
@@ -615,11 +613,11 @@ fn try_extract_git_blob_archive(
     let strip_logical_prefix = |logical: String| -> String {
         // decompress_file_to_temp builds logicals as
         // `<staged_path>!<entry>`. Replace the staged-path prefix with the
-        // real archive basename so report paths look like
-        // `aws_leak.apk!res/values/strings.xml`.
+        // real repo-relative archive path so report paths look like
+        // `dir/aws_leak.apk!res/values/strings.xml`.
         match logical.split_once('!') {
-            Some((_, entry)) => format!("{}!{}", basename, entry),
-            None => format!("{}!{}", basename, logical),
+            Some((_, entry)) => format!("{}!{}", archive_label, entry),
+            None => format!("{}!{}", archive_label, logical),
         }
     };
 
@@ -638,8 +636,18 @@ fn try_extract_git_blob_archive(
             for (logical, bytes) in files {
                 if total >= MAX_DISK_PATH_AGGREGATE_BYTES {
                     debug!(
-                        "{basename} disk-archive aggregate cap of {MAX_DISK_PATH_AGGREGATE_BYTES} bytes reached; truncating remaining entries"
+                        "{archive_label} disk-archive aggregate cap of {MAX_DISK_PATH_AGGREGATE_BYTES} bytes reached; truncating remaining entries"
                     );
+                    break;
+                }
+                let remaining = MAX_DISK_PATH_AGGREGATE_BYTES - total;
+                if bytes.len() as u64 > remaining {
+                    debug!(
+                        "{archive_label} disk-archive aggregate cap reached while reading {}; truncating entry",
+                        logical
+                    );
+                    let take = remaining as usize;
+                    out.push((strip_logical_prefix(logical), bytes[..take].to_vec()));
                     break;
                 }
                 total += bytes.len() as u64;
@@ -654,14 +662,38 @@ fn try_extract_git_blob_archive(
             for (logical, disk_path) in disk_entries {
                 if total >= MAX_DISK_PATH_AGGREGATE_BYTES {
                     debug!(
-                        "{basename} disk-archive aggregate cap of {MAX_DISK_PATH_AGGREGATE_BYTES} bytes reached; truncating remaining entries"
+                        "{archive_label} disk-archive aggregate cap of {MAX_DISK_PATH_AGGREGATE_BYTES} bytes reached; truncating remaining entries"
                     );
                     break;
                 }
-                match std::fs::read(&disk_path) {
-                    Ok(bytes) => {
+                let remaining = MAX_DISK_PATH_AGGREGATE_BYTES - total;
+                let entry_len = match std::fs::metadata(&disk_path) {
+                    Ok(md) => md.len(),
+                    Err(e) => {
+                        debug!("Failed to stat extracted entry {}: {e}", disk_path.display());
+                        continue;
+                    }
+                };
+                let file = match std::fs::File::open(&disk_path) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        debug!("Failed to open extracted entry {}: {e}", disk_path.display());
+                        continue;
+                    }
+                };
+                let to_read = entry_len.min(remaining);
+                let mut bytes = Vec::with_capacity(to_read as usize);
+                match file.take(to_read).read_to_end(&mut bytes) {
+                    Ok(_) => {
                         total += bytes.len() as u64;
                         out.push((strip_logical_prefix(logical), bytes));
+                        if entry_len > remaining {
+                            debug!(
+                                "{archive_label} disk-archive aggregate cap reached while reading {}; truncating entry",
+                                disk_path.display()
+                            );
+                            break;
+                        }
                     }
                     Err(e) => {
                         debug!("Failed to read extracted entry {}: {e}", disk_path.display());
@@ -673,11 +705,9 @@ fn try_extract_git_blob_archive(
 
         // Single-stream decompression (gz/bz2/xz/zlib) gives one logical
         // payload — present it as a single entry under the archive name.
-        CompressedContent::Raw(bytes) => {
-            vec![(format!("{}!content", basename), bytes)]
-        }
+        CompressedContent::Raw(bytes) => vec![(format!("{}!content", archive_label), bytes)],
         CompressedContent::RawFile(path) => match std::fs::read(&path) {
-            Ok(bytes) => vec![(format!("{}!content", basename), bytes)],
+            Ok(bytes) => vec![(format!("{}!content", archive_label), bytes)],
             Err(e) => {
                 debug!("Failed to read decompressed payload {}: {e}", path.display());
                 return Ok(None);

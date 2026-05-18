@@ -2319,7 +2319,11 @@ alerts:
         };
         let yaml = super::build_config_yaml(&scan_args, &global_args, init_matches).unwrap();
         let cfg = parse_str(&yaml).expect("emitted YAML must round-trip");
-        assert_eq!(cfg.git.github_api_url.as_deref(), Some("https://ghe.corp.example.com/api/v3/"),);
+        assert_eq!(
+            cfg.git.github_api_url.as_deref(),
+            Some("https://ghe.corp.example.com/api/v3/"),
+            "github_api_url must preserve a user-supplied trailing slash",
+        );
     }
 
     #[test]
