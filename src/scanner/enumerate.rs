@@ -704,15 +704,44 @@ fn try_extract_git_blob_archive(
         }
 
         // Single-stream decompression (gz/bz2/xz/zlib) gives one logical
-        // payload — present it as a single entry under the archive name.
-        CompressedContent::Raw(bytes) => vec![(format!("{}!content", archive_label), bytes)],
-        CompressedContent::RawFile(path) => match std::fs::read(&path) {
-            Ok(bytes) => vec![(format!("{}!content", archive_label), bytes)],
-            Err(e) => {
+        // payload; cap it just like aggregate archive-entry reads.
+        CompressedContent::Raw(mut bytes) => {
+            if bytes.len() as u64 > MAX_DISK_PATH_AGGREGATE_BYTES {
+                debug!(
+                    "{archive_label} single-stream payload exceeded {MAX_DISK_PATH_AGGREGATE_BYTES} byte cap; truncating"
+                );
+                bytes.truncate(MAX_DISK_PATH_AGGREGATE_BYTES as usize);
+            }
+            vec![(format!("{}!content", archive_label), bytes)]
+        }
+        CompressedContent::RawFile(path) => {
+            let payload_len = match std::fs::metadata(&path) {
+                Ok(md) => md.len(),
+                Err(e) => {
+                    debug!("Failed to stat decompressed payload {}: {e}", path.display());
+                    return Ok(None);
+                }
+            };
+            let file = match std::fs::File::open(&path) {
+                Ok(file) => file,
+                Err(e) => {
+                    debug!("Failed to open decompressed payload {}: {e}", path.display());
+                    return Ok(None);
+                }
+            };
+            let to_read = payload_len.min(MAX_DISK_PATH_AGGREGATE_BYTES);
+            let mut bytes = Vec::with_capacity(to_read as usize);
+            if let Err(e) = file.take(to_read).read_to_end(&mut bytes) {
                 debug!("Failed to read decompressed payload {}: {e}", path.display());
                 return Ok(None);
             }
-        },
+            if payload_len > MAX_DISK_PATH_AGGREGATE_BYTES {
+                debug!(
+                    "{archive_label} single-stream payload exceeded {MAX_DISK_PATH_AGGREGATE_BYTES} byte cap; truncating"
+                );
+            }
+            vec![(format!("{}!content", archive_label), bytes)]
+        }
     };
 
     if entries.is_empty() { Ok(None) } else { Ok(Some(entries)) }

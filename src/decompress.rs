@@ -161,6 +161,14 @@ pub fn extract_zip_archive_in_memory(
     data: &[u8],
     archive_label: &str,
 ) -> Result<Vec<(String, Vec<u8>)>> {
+    if data.len() > MAX_INMEM_ZIP_ARCHIVE_BYTES {
+        anyhow::bail!(
+            "zip archive {archive_label} is {} bytes, exceeding {} byte in-memory cap",
+            data.len(),
+            MAX_INMEM_ZIP_ARCHIVE_BYTES
+        );
+    }
+
     // Per-entry cap on decompressed bytes: bounds memory cost of zip bombs.
     // Mirrors the disk-streaming variant's cap.
     // nosemgrep: this is the defensive cap — do not flag for missing-limit rules.
