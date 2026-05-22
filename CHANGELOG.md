@@ -3,7 +3,9 @@
 All notable changes to this project will be documented in this file.
 
 ## [v1.101.0]
-- Fixed `failed to spawn thread: Os { code: 11, kind: WouldBlock }` panics during validation-heavy scans. Kingfisher built two Tokio runtimes (main + artifact-fetcher) that each defaulted to 512 blocking threads, which combined with Rayon pools and per-call spawns could exceed the OS per-user thread limit (`RLIMIT_NPROC`, default 8000 on macOS). Both runtimes now cap their blocking pools at `min(max(num_jobs * 8, 32), 256)`, and on Unix the soft `RLIMIT_NPROC` is raised to the hard limit before Kingfisher starts its worker threads so users don't need to tune `ulimit -u` manually.
+- Fixed asymmetric JWT validation panics by using a single `jsonwebtoken` crypto backend and adding RS256 regression coverage. Thanks @AgentEnder. [#386](https://github.com/mongodb/kingfisher/pull/386)
+- Validator panics now fail that validation result instead of crashing the scan, with panic payloads kept out of cached and user-visible validation responses. Thanks @AgentEnder. [#387](https://github.com/mongodb/kingfisher/pull/387)
+- Reduced `failed to spawn thread` errors in validation-heavy scans by capping Tokio blocking pools for the main and artifact-fetcher runtimes and raising the Unix soft `RLIMIT_NPROC` before worker startup.
 
 ## [v1.100.0]
 - Archive scanning now reaches inside Android/iOS app packages: added `apk`, `aab`, and `ipa` to the recognized ZIP-based archive formats so secrets embedded in APK/AAB/IPA contents (e.g. `classes*.dex`, `res/values/strings.xml`) are extracted and matched.
